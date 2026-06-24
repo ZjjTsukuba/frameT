@@ -1,6 +1,6 @@
 # Event-Camera Action Recognition with CLIP-LoRA + FrameTemporalMamba
 
-Code for our ACCV 2026 submission on **event-stream human action recognition**.
+Code for  **event-stream human action recognition**.
 
 A deliberately simple frame-based pipeline — frozen CLIP ViT-B/32 adapted with a
 small LoRA, a learnable CoOp text prompt, and an order-aware **FrameTemporalMamba**
