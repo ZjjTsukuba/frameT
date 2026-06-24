@@ -1,0 +1,15 @@
+# Core (frame-tower / "pytorch" env: python 3.8, CUDA 12.x)
+torch>=2.1
+transformers>=4.46        # CLIP ViT-B/32 (openai/clip-vit-base-patch32) + CoOp text tower
+numpy
+opencv-python             # cv2, frame rendering / denoise helpers
+Pillow                    # optional frame export
+
+# Event decoding
+dv-processing             # SeAct AEDAT4 decode (preprocess_seact.py). PAF AEDAT2.0 is decoded
+                          # by a self-contained parser in preprocess_paf.py (no extra dep).
+
+# Temporal model (optional but used by the SOTA config)
+# FrameTemporalMamba uses mamba_ssm if available, else falls back to a causal BiGRU.
+# mamba-ssm                # pip install mamba-ssm causal-conv1d  (needs matching CUDA toolchain)
+# causal-conv1d

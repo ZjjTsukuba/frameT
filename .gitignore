@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.pyc
+*.egg-info/
+.ipynb_checkpoints/
+
+# IDE
+.idea/
+.vscode/
+
+# Model checkpoints & training artifacts (kept out of git; available on request)
+*.pth
+*.ckpt
+logs/
+paf/temporal_logs/
+paf/temporal_paf_logs/
+paf/b2n_logs/
+*.log
+
+# Preprocessed dataset caches (regenerate with paf/preprocess_*.py)
+preprocessed/
+*.npz
+
+# OS
+.DS_Store
