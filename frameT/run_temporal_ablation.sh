@@ -5,12 +5,12 @@
 # Key Qs: (1) frameT>frameM => temporal helps without point; (2) temp~frameT => point redundant given temporal.
 set -u
 ROOT=/mnt/e/datasets/SeAct/preprocessed
-LOG=paf/temporal_logs
+LOG=frameT/temporal_logs
 mkdir -p "$LOG"
-COM="--root $ROOT --classes paf/SeAct_classes.json \
+COM="--root $ROOT --classes frameT/SeAct_classes.json \
 --train-file SeAct_train_norm.txt --val-file SeAct_val_norm.txt \
 --epochs 60 --T 8 --point-enc pointmamba --text coop --denoise --lora-r 4 --lr 1e-4 --fusion gated --workers 2"
-run() { local tag=$1; shift; python3 -m paf.train_paf $COM "$@" \
+run() { local tag=$1; shift; python3 -m frameT.train $COM "$@" \
         --out "$LOG/$tag.pth" > "$LOG/$tag.log" 2>&1; echo "DONE $tag"; }
 
 # frame-only (NO point) ablation, 3 seeds: mean vs temporal

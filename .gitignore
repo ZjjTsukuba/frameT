@@ -12,14 +12,19 @@ __pycache__/
 *.pth
 *.ckpt
 logs/
-paf/temporal_logs/
-paf/temporal_paf_logs/
-paf/b2n_logs/
+frameT/temporal_logs/
+frameT/temporal_paf_logs/
+frameT/b2n_logs/
 *.log
 
-# Preprocessed dataset caches (regenerate with paf/preprocess_*.py)
+# Preprocessed dataset caches (regenerate with frameT/preprocess_*.py)
 preprocessed/
 *.npz
 
 # OS
 .DS_Store
+
+# Local experiment results and sync backups (not part of the code release)
+results/
+.sync_backup_*/
+README_results_private.md

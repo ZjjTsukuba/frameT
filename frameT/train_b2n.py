@@ -11,7 +11,7 @@ Crux question this answers:
   (2) LoRA on base  -> does adapting the ViT to base classes HELP or KILL new-class transfer?
   (3) +gated motion -> does the point-cloud motion cue help NEW (unseen) classes?
 
-The model (PAFClipPointV2) outputs logits over ALL classes; base/new is done purely by
+The model (FrameTModel) outputs logits over ALL classes; base/new is done purely by
 slicing logit columns + remapping labels here, so the model is untouched. New file.
 """
 import os, sys, argparse, json
@@ -20,8 +20,8 @@ import torch
 from torch.utils.data import DataLoader
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from paf.paf_dataset import build_splits, PAFEvents
-from paf.model_v2 import PAFClipPointV2
+from frameT.event_dataset import build_splits, EventClipDataset
+from frameT.model_v2 import FrameTModel
 
 
 def split_base_new(classnames, base_frac=0.5, mode="alpha", seed=0):
@@ -54,7 +54,7 @@ def eval_subset(model, loader, device, cols, to_local, branch):
 def main():
     ap = argparse.ArgumentParser("PAF/SeAct base-to-new (open-vocab) training")
     ap.add_argument("--root", default="/mnt/e/datasets/SeAct/preprocessed")
-    ap.add_argument("--classes", default="paf/SeAct_classes.json")
+    ap.add_argument("--classes", default="frameT/SeAct_classes.json")
     ap.add_argument("--train-file", default="SeAct_train_norm.txt")
     ap.add_argument("--val-file", default="SeAct_val_norm.txt")
     ap.add_argument("--base-frac", type=float, default=0.5)
@@ -78,7 +78,7 @@ def main():
     ap.add_argument("--lora-r", type=int, default=0)
     ap.add_argument("--lora-alpha", type=int, default=16)
     ap.add_argument("--denoise", action="store_true")
-    ap.add_argument("--out", default="paf/seact_b2n.pth")
+    ap.add_argument("--out", default="frameT/seact_b2n.pth")
     args = ap.parse_args()
 
     import torch.multiprocessing as mp
@@ -124,7 +124,7 @@ def main():
     print(f"[data] train(base) {len(tr_base)}  val-base {len(te_base)}  val-new {len(te_new)}")
 
     def mk(idx, train):
-        ds = PAFEvents(args.root, idx, man, T=args.T, num_points=args.points, train=train,
+        ds = EventClipDataset(args.root, idx, man, T=args.T, num_points=args.points, train=train,
                        denoise=args.denoise, frame_repr="hist")
         return DataLoader(ds, batch_size=args.bs, shuffle=train, num_workers=args.workers,
                           drop_last=train, pin_memory=True, persistent_workers=args.workers > 0)
@@ -133,7 +133,7 @@ def main():
     vl_base, vl_new = mk(te_base, False), mk(te_new, False)
 
     # ---- model (holds ALL class prompts; base/new = column slicing) ----
-    model = PAFClipPointV2(classnames, hand_prompts=prompts, point_encoder=args.point_enc,
+    model = FrameTModel(classnames, hand_prompts=prompts, point_encoder=args.point_enc,
                            fusion=args.fusion, text=args.text, n_ctx=args.n_ctx,
                            lora_r=args.lora_r, lora_alpha=args.lora_alpha).to(device)
     params = [p for p in model.parameters() if p.requires_grad]

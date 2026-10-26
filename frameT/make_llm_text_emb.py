@@ -6,7 +6,7 @@ offline LLM (Claude, 2026-06-12) focusing on WHICH body parts move and HOW —
 the motion-structure information an event camera actually sees. Final anchor =
 mean of (template embedding, description embedding), L2-normalized.
 
-Run in the pytorch env:  python3 paf/make_llm_text_emb.py
+Run in the pytorch env:  python3 frameT/make_llm_text_emb.py
 """
 import json
 import os

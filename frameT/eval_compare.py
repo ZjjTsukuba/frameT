@@ -10,8 +10,8 @@ import numpy as np, torch
 from torch.utils.data import DataLoader
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from paf.paf_dataset import build_splits, PAFEvents
-from paf.model_v2 import PAFClipPointV2
+from frameT.event_dataset import build_splits, EventClipDataset
+from frameT.model_v2 import FrameTModel
 
 
 def main():
@@ -44,9 +44,9 @@ def main():
         classnames = [inv[i].replace("-", " ") for i in range(len(inv))]
         prompts = [f"a person {c}" for c in classnames]
 
-    model = PAFClipPointV2(classnames, hand_prompts=prompts, point_encoder=a.point_enc,
+    model = FrameTModel(classnames, hand_prompts=prompts, point_encoder=a.point_enc,
                            fusion="cross", text=a.text, lora_r=a.lora_r).to(dev)
-    val = PAFEvents(a.root, te, man, T=a.T, train=False, denoise=a.denoise)
+    val = EventClipDataset(a.root, te, man, T=a.T, train=False, denoise=a.denoise)
     vl = DataLoader(val, batch_size=16, num_workers=2)
 
     def run(ckpt, branch):

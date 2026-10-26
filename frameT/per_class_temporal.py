@@ -8,11 +8,11 @@ import torch
 from torch.utils.data import DataLoader
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from paf.paf_dataset import build_splits, PAFEvents
-from paf.model_v2 import PAFClipPointV2
+from frameT.event_dataset import build_splits, EventClipDataset
+from frameT.model_v2 import FrameTModel
 
 ROOT = "/mnt/e/datasets/SeAct/preprocessed"
-LOG = "paf/temporal_logs"
+LOG = "frameT/temporal_logs"
 DEV = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 # temporally-confusable / order-reversed pairs to watch
 WATCH = ["open the computer", "close the computer", "put on glasses", "put off glasses",
@@ -22,7 +22,7 @@ WATCH = ["open the computer", "close the computer", "put on glasses", "put off g
 
 @torch.no_grad()
 def per_class(ckpt, temporal, classnames, prompts, loader):
-    m = PAFClipPointV2(classnames, hand_prompts=prompts, point_encoder="pointmamba",
+    m = FrameTModel(classnames, hand_prompts=prompts, point_encoder="pointmamba",
                        fusion="gated", text="coop", lora_r=4, temporal_mamba=temporal).to(DEV)
     m.load_state_dict(torch.load(ckpt, map_location="cpu")["model"], strict=False)
     m.eval()
@@ -38,12 +38,12 @@ def per_class(ckpt, temporal, classnames, prompts, loader):
 
 
 def main():
-    names = json.load(open("paf/SeAct_classes.json"))
+    names = json.load(open("frameT/SeAct_classes.json"))
     classnames = [n.split(":")[0].replace("-", " ").strip() for n in names]
     prompts = [f"a photo of a person {n}" for n in classnames]
     tr, te, man = build_splits(os.path.join(ROOT, "manifest.json"), mode="exact",
                                train_file="SeAct_train_norm.txt", val_file="SeAct_val_norm.txt")
-    ds = PAFEvents(ROOT, te, man, T=8, num_points=4096, train=False, denoise=True, frame_repr="hist")
+    ds = EventClipDataset(ROOT, te, man, T=8, num_points=4096, train=False, denoise=True, frame_repr="hist")
     loader = DataLoader(ds, batch_size=16, shuffle=False, num_workers=2, pin_memory=True)
 
     bc, bt = per_class(f"{LOG}/base_s0.pth", False, classnames, prompts, loader)

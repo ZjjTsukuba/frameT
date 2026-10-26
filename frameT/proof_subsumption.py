@@ -20,17 +20,17 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from paf.paf_dataset import build_splits, PAFEvents
-from paf.model_v2 import PAFClipPointV2
-from paf.train_paf_b2n import split_base_new
+from frameT.event_dataset import build_splits, EventClipDataset
+from frameT.model_v2 import FrameTModel
+from frameT.train_b2n import split_base_new
 
 ROOT = "/mnt/e/datasets/SeAct/preprocessed"
-LOG = "paf/b2n_logs"
+LOG = "frameT/b2n_logs"
 DEV = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
 def load(ckpt, lora_r, classnames, prompts):
-    m = PAFClipPointV2(classnames, hand_prompts=prompts, point_encoder="pointmamba",
+    m = FrameTModel(classnames, hand_prompts=prompts, point_encoder="pointmamba",
                        fusion="gated", text="hand", lora_r=lora_r).to(DEV)
     m.load_state_dict(torch.load(ckpt, map_location="cpu")["model"], strict=False)
     m.eval()
@@ -74,7 +74,7 @@ def train_head(Xtr, ytr, Xva, yva, epochs=200):
 
 
 def main():
-    names = json.load(open("paf/SeAct_classes.json"))
+    names = json.load(open("frameT/SeAct_classes.json"))
     classnames = [n.split(":")[0].replace("-", " ").strip() for n in names]
     prompts = [f"a photo of a person {n}" for n in classnames]
 
@@ -95,7 +95,7 @@ def main():
         te_b = [i for i in te if items[i]["label"] in bset]
 
         def mk(idx):
-            ds = PAFEvents(ROOT, idx, man, T=8, num_points=4096, train=False, denoise=True, frame_repr="hist")
+            ds = EventClipDataset(ROOT, idx, man, T=8, num_points=4096, train=False, denoise=True, frame_repr="hist")
             return DataLoader(ds, batch_size=16, shuffle=False, num_workers=2, pin_memory=True)
 
         mf = load(f"{LOG}/frameW_s{S}.pth", 4, classnames, prompts)

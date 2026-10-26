@@ -4,9 +4,9 @@
 # 60-epoch jobs run 2-wide. New file.
 set -u
 ROOT=/mnt/e/datasets/SeAct/preprocessed
-LOG=paf/b2n_logs
+LOG=frameT/b2n_logs
 mkdir -p "$LOG"
-PY=paf/train_paf_b2n.py
+PY=frameT/train_b2n.py
 COM="--root $ROOT --denoise --workers 4 --split-mode random --seed 0"
 
 run() { local tag=$1; shift; python3 $PY $COM "$@" > "$LOG/$tag.log" 2>&1; echo "DONE $tag"; }

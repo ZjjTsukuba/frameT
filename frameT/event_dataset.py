@@ -63,10 +63,11 @@ def build_splits(manifest_path, mode="exact", test_ratio=0.2, test_subjects=None
     return sorted(tr), sorted(te), man
 
 
-class PAFEvents(Dataset):
+class EventClipDataset(Dataset):
     def __init__(self, root, indices, manifest, T=8, num_points=4096,
                  img_size=224, clip_norm=True, train=True, augment=True, denoise=False,
-                 frame_repr="hist", afe_root=None):
+                 frame_repr="hist", afe_root=None, bbox_crop=False,
+                 time_bins="uniform", interp=False):
         self.root = root
         self.items = [manifest["items"][i] for i in indices]
         self.W, self.H = manifest["W"], manifest["H"]
@@ -76,8 +77,28 @@ class PAFEvents(Dataset):
         self.denoise = denoise
         self.frame_repr = frame_repr
         self.afe_root = afe_root
+        self.bbox_crop = bbox_crop
+        self.time_bins = time_bins      # 'uniform' (default) | 'count' (equal events per frame, sec 3.2.5)
+        self.interp = interp            # linear temporal voting into adjacent frames (sec 3.2.6)
         self.label_map = manifest.get("label_map")
         self.num_classes = len(self.label_map) if self.label_map else manifest.get("num_classes", 0)
+
+    def _bbox_crop(self, x, y, t, p):
+        """Crop to the event spatial bounding box (1st/99th percentile, padded) so a small/distant
+        subject fills more of the frame after resize, instead of being diluted against background.
+        Falls back to the full canvas if the box is degenerate (too small or too few events)."""
+        if len(x) < 50:
+            return x, y, t, p, self.W, self.H
+        x0, x1 = np.percentile(x, [1, 99])
+        y0, y1 = np.percentile(y, [1, 99])
+        pad_x = max((x1 - x0) * 0.15, 15.0)
+        pad_y = max((y1 - y0) * 0.15, 15.0)
+        x0 = max(0, int(x0 - pad_x)); x1 = min(self.W, int(np.ceil(x1 + pad_x)))
+        y0 = max(0, int(y0 - pad_y)); y1 = min(self.H, int(np.ceil(y1 + pad_y)))
+        if x1 - x0 < 20 or y1 - y0 < 20:
+            return x, y, t, p, self.W, self.H
+        m = (x >= x0) & (x < x1) & (y >= y0) & (y < y1)
+        return x[m] - x0, y[m] - y0, t[m], p[m], x1 - x0, y1 - y0
 
     def _denoise(self, x, y, t, p, sx=4, st=20000, k=2):
         """Spatiotemporal density filter: drop events whose (sx·sx px, st µs) bin has < k events."""
@@ -127,10 +148,14 @@ class PAFEvents(Dataset):
             ten = (ten - CLIP_MEAN) / CLIP_STD
         return ten.float()
 
-    def _frames(self, x, y, t, p):
+    def _frames(self, x, y, t, p, W=None, H=None):
         if self.frame_repr == "tsurf":
             return self._frames_tsurf(x, y, t, p)
-        T, H, W = self.T, self.H, self.W
+        T = self.T
+        W = self.W if W is None else W
+        H = self.H if H is None else H
+        if (self.time_bins != "uniform" or self.interp) and self.frame_repr in ("hist", "histw", "histt"):
+            return self._frames_adaptive(x, y, t, p, W, H)
         tmax = int(t.max()) if len(t) else 0
         if len(t) == 0:
             return torch.zeros(T, 3, self.S, self.S)
@@ -167,6 +192,64 @@ class PAFEvents(Dataset):
         if self.clip_norm:
             ten = (ten - CLIP_MEAN) / CLIP_STD
         return ten.float()  # [T,3,S,S]
+
+    def _frames_adaptive(self, x, y, t, p, W, H):
+        """Frames with (a) equal-event-count time bins and/or (b) linear temporal interpolation.
+        With time_bins='uniform' and interp=False this reproduces _frames exactly."""
+        T = self.T
+        n = len(t)
+        if n == 0:
+            return torch.zeros(T, 3, self.S, self.S)
+        tmax = int(t.max())
+        if self.time_bins == "count":
+            pos = T * np.arange(n, dtype=np.float64) / n              # continuous frame position in [0, T)
+        else:
+            pos = (t.astype(np.float64) / (tmax + 1) * T) if tmax > 0 else np.zeros(n)
+        bins = np.minimum(pos.astype(np.int64), T - 1)
+        fr = np.zeros((T, 2, H, W), np.float32)
+        if self.interp:
+            u = np.clip(pos - 0.5, 0.0, T - 1.0)                        # frame i has its centre at u = i
+            i0 = np.floor(u).astype(np.int64)
+            w1 = (u - i0).astype(np.float32)
+            i1 = np.minimum(i0 + 1, T - 1)
+            np.add.at(fr, (i0, p, y, x), 1.0 - w1)
+            np.add.at(fr, (i1, p, y, x), w1)
+        else:
+            np.add.at(fr, (bins, p, y, x), 1.0)
+        on, off = fr[:, 1], fr[:, 0]
+
+        def norm(a):
+            out = np.empty_like(a)
+            for i in range(a.shape[0]):
+                ai = a[i]
+                v = np.percentile(ai[ai > 0], 99) if (ai > 0).any() else 1.0
+                out[i] = np.clip(ai / max(v, 1.0), 0, 1)
+            return out
+
+        on_n, off_n = norm(on), norm(off)
+        if self.frame_repr == "histt":                   # G = mean intra-frame relative time (sec 3.2.3)
+            if self.time_bins == "count":
+                first = np.searchsorted(bins, np.arange(T + 1))
+                t_start = np.array([t[min(first[i], n - 1)] for i in range(T)], np.float64)
+                t_end = np.array([t[first[i + 1]] if first[i + 1] < n else tmax + 1 for i in range(T)], np.float64)
+                width = np.maximum(t_end - t_start, 1.0)
+                frac = np.clip((t - t_start[bins]) / width[bins], 0.0, 1.0).astype(np.float32)
+            else:
+                frac = np.clip(pos - bins, 0.0, 1.0).astype(np.float32)
+            tsum = np.zeros((T, H, W), np.float32); tcnt = np.zeros((T, H, W), np.float32)
+            np.add.at(tsum, (bins, y, x), frac)
+            np.add.at(tcnt, (bins, y, x), 1.0)
+            tmean = tsum / np.maximum(tcnt, 1.0)
+            rgb = np.stack([on_n, tmean, off_n], 1)
+        elif self.frame_repr == "histw":
+            rgb = np.clip(np.stack([1 - off_n, 1 - on_n - off_n, 1 - on_n], 1), 0, 1)
+        else:
+            rgb = np.stack([on_n, np.zeros_like(on_n), off_n], 1)
+        ten = torch.from_numpy(rgb.astype(np.float32))
+        ten = torch.nn.functional.interpolate(ten, size=(self.S, self.S), mode="bilinear", align_corners=False)
+        if self.clip_norm:
+            ten = (ten - CLIP_MEAN) / CLIP_STD
+        return ten.float()
 
     def _points(self, x, y, t, p):
         n, N = len(t), self.N
@@ -212,7 +295,13 @@ class PAFEvents(Dataset):
             x, y, t, p = self._denoise(x, y, t, p)
         if self.train and self.augment and self.frame_repr != "afe":
             x, y, t, p = self._augment(x, y, t, p)      # event-aug skipped for precomputed AFE frames
-        frames = self._load_afe(it) if self.frame_repr == "afe" else self._frames(x, y, t, p)
+        if self.frame_repr == "afe":
+            frames = self._load_afe(it)
+        elif self.bbox_crop and self.frame_repr != "tsurf":
+            xc, yc, tc, pc, Wc, Hc = self._bbox_crop(x, y, t, p)
+            frames = self._frames(xc, yc, tc, pc, Wc, Hc)
+        else:
+            frames = self._frames(x, y, t, p)
         return frames, self._points(x, y, t, p), label
 
 
@@ -226,7 +315,7 @@ if __name__ == "__main__":  # quick self-test
     a = ap.parse_args()
     tr, te, man = build_splits(os.path.join(a.root, "manifest.json"), mode="exact")
     print(f"split=ExACT -> train {len(tr)} test {len(te)} | classes {len(man['label_map'])}")
-    ds = PAFEvents(a.root, tr, man, T=a.T, num_points=a.N, clip_norm=False, train=True)
+    ds = EventClipDataset(a.root, tr, man, T=a.T, num_points=a.N, clip_norm=False, train=True)
     f, pts, lab = ds[0]
     inv = {v: k for k, v in man["label_map"].items()}
     print(f"item0: frames {tuple(f.shape)} points {tuple(pts.shape)} label {lab}({inv[lab]})")
@@ -243,3 +332,7 @@ if __name__ == "__main__":  # quick self-test
         print("saved frame montage ->", a.viz)
     except Exception as e:
         print("viz skipped:", e)
+
+
+# old name (kept for compatibility)
+PAFEvents = EventClipDataset

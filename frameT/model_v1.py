@@ -202,7 +202,7 @@ class CrossAttnFusion(nn.Module):
         return x.mean(1)                                 # pool over frame tokens
 
 
-class PAFClipPoint(nn.Module):
+class FrameTModelV1(nn.Module):
     def __init__(self, class_prompts, clip_name="openai/clip-vit-base-patch32", point_dim=512,
                  point_encoder="pointnet2", fusion="concat"):
         super().__init__()
@@ -257,3 +257,7 @@ class PAFClipPoint(nn.Module):
             fused = self.fuse(torch.cat([f_frame, f_point], dim=1))
         fused = F.normalize(fused, dim=-1)
         return self.logit_scale.exp() * fused @ self.text_feats.t()   # [B,C]
+
+
+# old name (kept for compatibility)
+PAFClipPoint = FrameTModelV1

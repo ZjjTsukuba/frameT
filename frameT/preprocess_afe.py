@@ -8,7 +8,7 @@ import os, sys, json, argparse
 import numpy as np
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from paf.afe import adaptive_sample
+from frameT.afe import adaptive_sample
 
 
 def main():

@@ -8,6 +8,7 @@ FROZEN: CLIP image + text.  TRAINABLE: prompt ctx + point encoder + fusion.
 New file.
 """
 import contextlib
+import math
 
 import torch
 import torch.nn as nn
@@ -15,7 +16,7 @@ import torch.nn.functional as F
 from transformers import CLIPModel, CLIPTokenizer
 from transformers.modeling_attn_mask_utils import _create_4d_causal_attention_mask
 
-from paf.model_v1 import PointMambaEncoder, PointNet2Encoder, PointNetEncoder, CrossAttnFusion, TemporalPointEncoder
+from frameT.model_v1 import PointMambaEncoder, PointNet2Encoder, PointNetEncoder, CrossAttnFusion, TemporalPointEncoder
 
 
 class LoRALinear(nn.Module):
@@ -98,32 +99,140 @@ class InjectBlock(nn.Module):
         return h + torch.tanh(self.gate) * a
 
 
+class _S4D(nn.Module):
+    """Minimal diagonal state-space (S4D-Lin) layer, input-independent kernel (LTI), for the temporal-model comparison."""
+    def __init__(self, dim, n_state=16, dt_min=0.001, dt_max=0.1):
+        super().__init__()
+        self.log_dt = nn.Parameter(torch.rand(dim) * (math.log(dt_max) - math.log(dt_min)) + math.log(dt_min))
+        self.A_re = nn.Parameter(torch.full((dim, n_state), -0.5))
+        self.A_im = nn.Parameter(math.pi * torch.arange(n_state).float().repeat(dim, 1))
+        self.C = nn.Parameter(torch.randn(dim, n_state, 2) * (n_state ** -0.5))
+        self.D = nn.Parameter(torch.randn(dim))
+        self.out = nn.Linear(dim, dim * 2)                    # GLU output mixing
+
+    def forward(self, u):                                     # u [B,T,H] -> [B,T,H] (causal)
+        B, T, H = u.shape
+        dt = torch.exp(self.log_dt).unsqueeze(-1)             # [H,1]
+        A = torch.complex(self.A_re, self.A_im)               # [H,N]
+        dtA = A * dt
+        C = torch.view_as_complex(self.C)                     # [H,N]
+        t = torch.arange(T, device=u.device).view(1, 1, T)
+        K = 2 * ((C * (torch.exp(dtA) - 1) / A).unsqueeze(-1) * torch.exp(dtA.unsqueeze(-1) * t)).sum(1).real   # [H,T]
+        idx = torch.arange(T, device=u.device)
+        lag = idx.view(-1, 1) - idx.view(1, -1)               # [T,T]  (t - s)
+        Kmat = torch.where(lag >= 0, K[:, lag.clamp(min=0)], torch.zeros((), device=u.device))   # [H,T,T]
+        y = torch.einsum("hts,bsh->bth", Kmat, u) + u * self.D
+        return F.glu(self.out(F.gelu(y)), dim=-1)
+
+
+class _CausalTCN(nn.Module):
+    """2 causal dilated conv layers (kernel 3, dilation 1 and 2) with GELU."""
+    def __init__(self, dim, k=3):
+        super().__init__()
+        self.convs = nn.ModuleList([nn.Conv1d(dim, dim, k, dilation=d) for d in (1, 2)])
+        self.pads = [(k - 1) * d for d in (1, 2)]
+
+    def forward(self, x):                                     # [B,T,H]
+        y = x.transpose(1, 2)
+        for conv, pad in zip(self.convs, self.pads):
+            y = F.gelu(conv(F.pad(y, (pad, 0))))
+        return y.transpose(1, 2)
+
+
+class _TinyTransformer(nn.Module):
+    """1 pre-norm Transformer encoder layer with learned time embeddings (bidirectional attention)."""
+    def __init__(self, dim, max_len=64):
+        super().__init__()
+        self.pos = nn.Parameter(torch.zeros(1, max_len, dim))
+        nn.init.normal_(self.pos, std=0.02)
+        layer = nn.TransformerEncoderLayer(dim, 8, dim, dropout=0.1, activation="gelu", batch_first=True, norm_first=True)
+        self.enc = nn.TransformerEncoder(layer, 1)
+
+    def forward(self, x):
+        return self.enc(x + self.pos[:, :x.shape[1]])
+
+
 class FrameTemporalMamba(nn.Module):
     """Order-aware temporal modeling over the T per-frame CLIP tokens (frames pre-ordered in time).
     Same recipe as model_v1.TemporalMamba (Mamba SSM; BiGRU fallback) minus the t-sort; residual.
-    Fixes the order-blindness of the mean-pool over T (targets temporally-confusable actions)."""
-    def __init__(self, dim):
+    Fixes the order-blindness of the mean-pool over T (targets temporally-confusable actions).
+    kind: 'mamba' (default; BiGRU fallback if mamba_ssm is missing) | 'gru' | 'lstm' | 'transformer' | 'tcn' | 's4'
+    (the non-mamba kinds exist for the temporal-model comparison; all share the interface x + seq(LN(x)))."""
+    def __init__(self, dim, kind="mamba", gate="auto"):
         super().__init__()
         self.norm = nn.LayerNorm(dim)
-        try:
-            from mamba_ssm import Mamba
-            self.seq, self.kind = Mamba(d_model=dim), "mamba"
-        except Exception as e:                                # robust fallback
-            self.seq, self.kind = nn.GRU(dim, dim // 2, batch_first=True, bidirectional=True), "gru"
-            print(f"[FrameTemporalMamba] mamba_ssm unavailable ({e}); using BiGRU")
+        self.kind = kind
+        # non-mamba kinds are new/unproven in end-to-end training here; start them near-identity
+        # (tanh-gate, zero-init) like every other new module in this file (LoRA B=0, patch_pool gate<0,
+        # GatedCrossAttnFusion gate<0) instead of adding a randomly-initialized branch at full strength.
+        # gate: "auto" = gate on non-mamba kinds only (main setting); "on"/"off" force it (fairness check)
+        use_gate = (kind != "mamba") if gate == "auto" else (gate == "on")
+        self.gate = nn.Parameter(torch.zeros(1)) if use_gate else None
+        if kind == "mamba":
+            try:
+                from mamba_ssm import Mamba
+                self.seq = Mamba(d_model=dim)
+            except Exception as e:                            # robust fallback
+                self.seq, self.kind = nn.GRU(dim, dim // 2, batch_first=True, bidirectional=True), "gru"
+                print(f"[FrameTemporalMamba] mamba_ssm unavailable ({e}); using BiGRU")
+        elif kind == "gru":
+            self.seq = nn.GRU(dim, dim // 2, batch_first=True, bidirectional=True)
+        elif kind == "lstm":
+            self.seq = nn.LSTM(dim, dim // 2, batch_first=True, bidirectional=True)
+        elif kind == "transformer":
+            self.seq = _TinyTransformer(dim)
+        elif kind == "tcn":
+            self.seq = _CausalTCN(dim)
+        elif kind == "s4":
+            self.seq = _S4D(dim)
+        else:
+            raise ValueError(f"unknown temporal kind: {kind}")
 
     def forward(self, x):                                     # x [B,T,dim], frames time-ordered
         y = self.norm(x)
-        y = self.seq(y)[0] if self.kind == "gru" else self.seq(y)
+        y = self.seq(y)[0] if self.kind in ("gru", "lstm") else self.seq(y)
+        if self.gate is not None:
+            y = torch.tanh(self.gate) * y
         return x + y                                          # residual
+
+
+class PatchAttnPool(nn.Module):
+    """Attention-pool ViT patch tokens (local appearance detail: joint/pose-level cues) and fuse
+    them into the global [CLS] embedding. Targets the case where mean/CLS-only pooling over frames
+    loses fine-grained appearance detail that separates visually-similar actions (e.g. PAF, where
+    classes differ mainly in subtle body-part appearance rather than gross motion).
+    zero-init out_proj + negative-init gate -> starts as identity (pure CLS), learns to open."""
+    def __init__(self, vis_dim, dim, heads=8):
+        super().__init__()
+        self.patch_norm = nn.LayerNorm(vis_dim)
+        self.q_proj = nn.Linear(dim, vis_dim)
+        self.attn = nn.MultiheadAttention(vis_dim, heads, batch_first=True)
+        self.out_proj = nn.Linear(vis_dim, dim)
+        self.gate = nn.Parameter(torch.tensor(-2.0))          # sigmoid(-2)=0.12 -> start mostly CLS-only
+        nn.init.zeros_(self.out_proj.weight)
+        nn.init.zeros_(self.out_proj.bias)
+
+    def forward(self, cls_feat, patch_tok):                  # cls_feat [N,dim], patch_tok [N,L-1,vis_dim]
+        kv = self.patch_norm(patch_tok)
+        q = self.q_proj(cls_feat).unsqueeze(1)                # [N,1,vis_dim]
+        a, _ = self.attn(q, kv, kv)                           # [N,1,vis_dim]
+        local = self.out_proj(a.squeeze(1))                   # [N,dim]
+        return cls_feat + torch.sigmoid(self.gate) * local
 
 
 class PromptLearner(nn.Module):
     """CoOp: learnable context tokens spliced between [BOS] and [class name .][EOS] (HF CLIP)."""
-    def __init__(self, classnames, clip_model, tokenizer, n_ctx=16):
+    def __init__(self, classnames, clip_model, tokenizer, n_ctx=16, ctx_init=None):
         super().__init__()
         ctx_dim = clip_model.text_model.config.hidden_size               # 512
         ctx = torch.empty(n_ctx, ctx_dim); nn.init.normal_(ctx, std=0.02)
+        if ctx_init:                                                     # CoOp ctx init from a template's word
+            # embeddings (e.g. "a photo of a person"): starts at CLIP's zero-shot prompt instead of noise.
+            # The random draw above is kept so the RNG stream (data order etc.) matches the random-init run.
+            init_ids = tokenizer(ctx_init, return_tensors="pt").input_ids[0, 1:-1]   # drop BOS/EOS
+            with torch.no_grad():
+                ctx = clip_model.text_model.embeddings.token_embedding(init_ids).clone()
+            n_ctx = ctx.shape[0]
         self.ctx = nn.Parameter(ctx)                                     # learnable context
         prefix = " ".join(["X"] * n_ctx)
         prompts = [f"{prefix} {name}." for name in classnames]
@@ -141,12 +250,13 @@ class PromptLearner(nn.Module):
         return torch.cat([self.head, ctx, self.tail], dim=1)             # [C,77,512]
 
 
-class PAFClipPointV2(nn.Module):
+class FrameTModel(nn.Module):
     def __init__(self, classnames, hand_prompts=None, point_encoder="pointmamba",
                  fusion="cross", text="coop", n_ctx=16, lora_r=0, lora_alpha=16,
-                 img_adapter=False, inject_every=0, temporal_mamba=False,
-                 clip_name="openai/clip-vit-base-patch32"):
+                 img_adapter=False, inject_every=0, temporal_mamba=False, patch_pool=False, temporal_kind="mamba",
+                 temporal_gate="auto", frame_head="mlp", ctx_init=None, clip_name="openai/clip-vit-base-patch32"):
         super().__init__()
+        self.frame_head = frame_head          # 'mlp' (legacy concat-MLP) | 'none' (direct CLIP embedding, frame branch)
         self.clip = CLIPModel.from_pretrained(clip_name)
         self.tok = CLIPTokenizer.from_pretrained(clip_name)
         for p in self.clip.parameters():
@@ -187,14 +297,24 @@ class PAFClipPointV2(nn.Module):
             print(f"[inject] motion injected after ViT layers: {sorted(int(k) for k in self.inject)}")
         else:
             self.inject = nn.ModuleDict()
-        self.temporal = FrameTemporalMamba(dim) if temporal_mamba else None   # order-aware over T frames
+        # temporal-kind comparison study: different kinds consume different amounts of RNG state
+        # during their own random init, which would otherwise shift every subsequent random init
+        # (CoOp ctx, etc.) depending on which kind was picked -- sandbox it so only the temporal
+        # module itself differs between kinds, for a controlled comparison.
+        _rng = torch.get_rng_state()
+        self.temporal = FrameTemporalMamba(dim, temporal_kind, temporal_gate) if temporal_mamba else None   # order-aware over T frames
+        torch.set_rng_state(_rng)
         if temporal_mamba:
             print("[temporal] FrameTemporalMamba on frame tokens (order-aware, replaces mean-pool blindness)")
+        vdim = self.clip.config.vision_config.hidden_size                    # 768
+        self.patch_pool = PatchAttnPool(vdim, dim) if patch_pool else None
+        if patch_pool:
+            print("[patch_pool] ViT patch-token local-feature attention pooling fused with CLS")
         self.logit_scale = nn.Parameter(torch.tensor(2.659438))
 
         self.text = text
         if text == "coop":
-            self.prompt_learner = PromptLearner(classnames, self.clip, self.tok, n_ctx)
+            self.prompt_learner = PromptLearner(classnames, self.clip, self.tok, n_ctx, ctx_init=ctx_init)
         else:
             prompts = hand_prompts or [f"a photo of a person {c}" for c in classnames]
             with torch.no_grad():
@@ -218,7 +338,14 @@ class PAFClipPointV2(nn.Module):
         B, T = frames.shape[:2]
         ctx = contextlib.nullcontext() if self.use_lora else torch.no_grad()
         with ctx:                                                        # LoRA needs grad into ViT
-            f = self.clip.get_image_features(pixel_values=frames.flatten(0, 1))
+            if self.patch_pool is not None:
+                vm = self.clip.vision_model
+                h = vm.pre_layrnorm(vm.embeddings(frames.flatten(0, 1)))
+                h = vm.encoder(inputs_embeds=h)[0]                       # [B*T,L,vdim]
+                cls_feat = self.clip.visual_projection(vm.post_layernorm(h[:, 0, :]))
+                f = self.patch_pool(cls_feat, h[:, 1:, :])                # fuse local patch detail
+            else:
+                f = self.clip.get_image_features(pixel_values=frames.flatten(0, 1))
         return f.view(B, T, -1)
 
     def _img_tokens_inject(self, frames, motion):                        # motion injected per ViT layer
@@ -252,6 +379,10 @@ class PAFClipPointV2(nn.Module):
             if self.fusion in ("cross", "deep", "gated"):
                 fused = f_tok.mean(1) if branch == "frame" else self.fusion_mod(
                     f_tok, self.point(points, return_tokens=True))
+            elif branch == "frame" and self.frame_head == "none":
+                # frame-only: compare the CLIP image embedding with the text directly (keeps CLIP's
+                # image-text alignment at init; the random concat-MLP can collapse all clips to one vector)
+                fused = f_tok.mean(1)
             else:
                 f_pt = self.point(points)
                 if branch == "frame":
@@ -259,3 +390,7 @@ class PAFClipPointV2(nn.Module):
                 fused = self.fuse(torch.cat([f_tok.mean(1), f_pt], dim=1))
         fused = F.normalize(fused, dim=-1)
         return self.logit_scale.exp() * fused @ self._text_feats().t()
+
+
+# old name (kept for compatibility)
+PAFClipPointV2 = FrameTModel

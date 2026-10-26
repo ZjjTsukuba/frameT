@@ -13,9 +13,9 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from paf.paf_dataset import build_splits, PAFEvents
-from paf.model_v2 import PAFClipPointV2
-from paf.train_paf_b2n import split_base_new
+from frameT.event_dataset import build_splits, EventClipDataset
+from frameT.model_v2 import FrameTModel
+from frameT.train_b2n import split_base_new
 
 
 def load_into(model, ckpt):
@@ -45,10 +45,10 @@ def acc_at(cf, cp, lb, a):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--root", default="/mnt/e/datasets/SeAct/preprocessed")
-    ap.add_argument("--classes", default="paf/SeAct_classes.json")
+    ap.add_argument("--classes", default="frameT/SeAct_classes.json")
     ap.add_argument("--train-file", default="SeAct_train_norm.txt")
     ap.add_argument("--val-file", default="SeAct_val_norm.txt")
-    ap.add_argument("--logdir", default="paf/b2n_logs")
+    ap.add_argument("--logdir", default="frameT/b2n_logs")
     ap.add_argument("--splits", default="0,1,2")
     ap.add_argument("--T", type=int, default=8)
     ap.add_argument("--points", type=int, default=4096)
@@ -82,13 +82,13 @@ def main():
         te_base = [i for i in te if items[i]["label"] in bset]
 
         def mk(idx):
-            ds = PAFEvents(args.root, idx, man, T=args.T, num_points=args.points, train=False,
+            ds = EventClipDataset(args.root, idx, man, T=args.T, num_points=args.points, train=False,
                            denoise=True, frame_repr="hist")
             return DataLoader(ds, batch_size=16, shuffle=False, num_workers=2, pin_memory=True)
 
-        model_f = load_into(PAFClipPointV2(classnames, hand_prompts=prompts, point_encoder="pointmamba",
+        model_f = load_into(FrameTModel(classnames, hand_prompts=prompts, point_encoder="pointmamba",
                             fusion="gated", text="hand", lora_r=4).to(dev), f"{args.logdir}/frameW_s{S}.pth")
-        model_p = load_into(PAFClipPointV2(classnames, hand_prompts=prompts, point_encoder="pointmamba",
+        model_p = load_into(FrameTModel(classnames, hand_prompts=prompts, point_encoder="pointmamba",
                             fusion="gated", text="hand", lora_r=0).to(dev), f"{args.logdir}/pointW_s{S}.pth")
 
         cf, cp, lb = collect(model_f, model_p, mk(te_new), dev, new_cols, to_new)
