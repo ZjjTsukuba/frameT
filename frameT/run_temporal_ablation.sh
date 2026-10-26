@@ -1,6 +1,6 @@
 #!/bin/bash
 # Firm up the TemporalMamba gain: 2x2 ablation (frame/gated x mean/temporal) + more seeds.
-#   frameM = frame-only mean-pool (baseline ~69.8) | frameT = frame + TemporalMamba (no point)
+#   frameM = frame-only mean-pool baseline | frameT = frame + TemporalMamba (no point)
 #   base   = gated mean-pool (have s0-2)           | temp   = gated + TemporalMamba (have s0-2)
 # Key Qs: (1) frameT>frameM => temporal helps without point; (2) temp~frameT => point redundant given temporal.
 set -u

@@ -28,3 +28,7 @@ preprocessed/
 results/
 .sync_backup_*/
 README_results_private.md
+
+# Local PAF diagnostic scripts (one-off analyses, kept locally)
+check_paf_split.py
+paf_*.py
